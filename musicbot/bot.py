@@ -350,28 +350,28 @@ class MusicBot(discord.Client):
             await self.ws.send(utils.to_json(payload))
             self.the_voice_clients[server.id].channel = channel
 
-    async def get_player(self, channel, create=False) -> MusicPlayer:
+    async def get_player(self, channel, author, create=False) -> MusicPlayer:
         server = channel.server
 
         if server.id not in self.players:
             if not create:
-                raise exceptions.CommandError(
-                    'The bot is not in a voice channel.  '
-                    'Use %ssummon to summon it to your voice channel.' % self.config.command_prefix)
+                await self.cmd_summon(channel, author, channel)
+            if getattr(channel, 'type', ChannelType.text) == ChannelType.voice:
 
-            voice_client = await self.get_voice_client(channel)
+                voice_client = await self.get_voice_client(channel)
 
-            playlist = Playlist(self)
-            player = MusicPlayer(self, voice_client, playlist) \
-                .on('play', self.on_player_play) \
-                .on('resume', self.on_player_resume) \
-                .on('pause', self.on_player_pause) \
-                .on('stop', self.on_player_stop) \
-                .on('finished-playing', self.on_player_finished_playing) \
-                .on('entry-added', self.on_player_entry_added)
+                playlist = Playlist(self)
+                player = MusicPlayer(self, voice_client, playlist) \
+                    .on('play', self.on_player_play) \
+                    .on('resume', self.on_player_resume) \
+                    .on('pause', self.on_player_pause) \
+                    .on('stop', self.on_player_stop) \
+                    .on('finished-playing', self.on_player_finished_playing) \
+                    .on('entry-added', self.on_player_entry_added)
 
-            player.skip_state = SkipState()
-            self.players[server.id] = player
+                
+                player.skip_state = SkipState()
+                self.players[server.id] = player
 
         return self.players[server.id]
 
@@ -414,33 +414,8 @@ class MusicBot(discord.Client):
         await self.update_now_playing()
 
     async def on_player_finished_playing(self, player, **_):
-        if not player.playlist.entries and not player.current_entry and self.config.auto_playlist:
-            while self.autoplaylist:
-                song_url = choice(self.autoplaylist)
-                info = await self.downloader.safe_extract_info(player.playlist.loop, song_url, download=False, process=False)
-
-                if not info:
-                    self.autoplaylist.remove(song_url)
-                    self.safe_print("[Info] Removing unplayable song from autoplaylist: %s" % song_url)
-                    write_file(self.config.auto_playlist_file, self.autoplaylist)
-                    continue
-
-                if info.get('entries', None):  # or .get('_type', '') == 'playlist'
-                    pass  # Wooo playlist
-                    # Blarg how do I want to do this
-
-                # TODO: better checks here
-                try:
-                    await player.playlist.add_entry(song_url, channel=None, author=None)
-                except exceptions.ExtractionError as e:
-                    print("Error adding song from autoplaylist:", e)
-                    continue
-
-                break
-
-            if not self.autoplaylist:
-                print("[Warning] No playable songs in the autoplaylist, disabling.")
-                self.config.auto_playlist = False
+        if not player.playlist.entries and not player.current_entry:
+            await self.disconnect_all_voice_clients()
 
     async def on_player_entry_added(self, playlist, entry, **_):
         pass
@@ -713,12 +688,53 @@ class MusicBot(discord.Client):
                 print("Done!", flush=True)  # TODO: Change this to "Joined server/channel"
                 if self.config.auto_playlist:
                     print("Starting auto-playlist")
-                    await self.on_player_finished_playing(await self.get_player(owner_vc))
+                    await self.on_player_finished_playing(await self.get_player(owner_vc, "a"))
             else:
                 print("Owner not found in a voice channel, could not autosummon.")
 
         print()
         # t-t-th-th-that's all folks!
+
+    async def cmd_summon(self, channel, author, voice_channel):
+        """
+        Usage:
+            {command_prefix}summon
+
+        Call the bot to the summoner's voice channel.
+        """
+
+        if not author.voice_channel:
+            raise exceptions.CommandError('You are not in a voice channel!', expire_in=25)
+
+        voice_client = self.the_voice_clients.get(channel.server.id, None)
+        if voice_client and voice_client.channel.server == author.voice_channel.server:
+            await self.move_voice_client(author.voice_channel)
+            return
+
+        # move to _verify_vc_perms?
+        chperms = author.voice_channel.permissions_for(author.voice_channel.server.me)
+
+        if not chperms.connect:
+            self.safe_print("Cannot join channel \"%s\", no permission." % author.voice_channel.name)
+            return Response(
+                "```Cannot join channel \"%s\", no permission.```" % author.voice_channel.name,
+                delete_after=25
+            )
+
+        elif not chperms.speak:
+            self.safe_print("Will not join channel \"%s\", no permission to speak." % author.voice_channel.name)
+            return Response(
+                "```Will not join channel \"%s\", no permission to speak.```" % author.voice_channel.name,
+                delete_after=25
+            )
+
+        player = await self.get_player(author.voice_channel, author, create=True)
+
+        if player.is_stopped:
+            player.play()
+
+        if self.config.auto_playlist:
+            await self.on_player_finished_playing(player)
 
     async def cmd_help(self, command=None):
         """
@@ -842,7 +858,7 @@ class MusicBot(discord.Client):
         except:
             raise exceptions.CommandError('Invalid URL provided:\n{}\n'.format(server_link), expire_in=30)
 
-    async def cmd_play(self, player, channel, author, permissions, leftover_args, song_url):
+    async def cmd_play(self, player, channel, author, permissions, leftover_args, song_url, voice_channel):
         """
         Usage:
             {command_prefix}play song_link
@@ -851,6 +867,8 @@ class MusicBot(discord.Client):
         Adds the song to the playlist.  If a link is not provided, the first
         result from a youtube search is added to the queue.
         """
+
+        await self.cmd_summon(channel,author,voice_channel)
 
         song_url = song_url.strip('<>')
 
@@ -1013,7 +1031,7 @@ class MusicBot(discord.Client):
                     print("[Info] Assumed url \"%s\" was a single entry, was actually a playlist" % song_url)
                     print("[Info] Using \"%s\" instead" % e.use_url)
 
-                return await self.cmd_play(player, channel, author, permissions, leftover_args, e.use_url)
+                return await self.cmd_play(player, channel, author, permissions, leftover_args, e.use_url, voice_channel)
 
             reply_text = "Enqueued **%s** to be played. Position in queue: %s"
             btext = entry.title
@@ -1128,7 +1146,7 @@ class MusicBot(discord.Client):
         return Response("Enqueued {} songs to be played in {} seconds".format(
             songs_added, self._fixg(ttime, 1)), delete_after=30)
 
-    async def cmd_search(self, player, channel, author, permissions, leftover_args):
+    async def cmd_search(self, player, channel, author, permissions, leftover_args, voice_channel):
         """
         Usage:
             {command_prefix}search [service] [number] query
@@ -1248,7 +1266,7 @@ class MusicBot(discord.Client):
                 await self.safe_delete_message(confirm_message)
                 await self.safe_delete_message(response_message)
 
-                await self.cmd_play(player, channel, author, permissions, [], e['webpage_url'])
+                await self.cmd_play(player, channel, author, permissions, [], e['webpage_url'],voice_channel)
 
                 return Response("Alright, coming right up!", delete_after=30)
             else:
@@ -1322,7 +1340,7 @@ class MusicBot(discord.Client):
                 delete_after=25
             )
 
-        player = await self.get_player(author.voice_channel, create=True)
+        player = await self.get_player(author.voice_channel, author, create=True)
 
         if player.is_stopped:
             player.play()
@@ -1869,7 +1887,7 @@ class MusicBot(discord.Client):
                 handler_kwargs['server'] = message.server
 
             if params.pop('player', None):
-                handler_kwargs['player'] = await self.get_player(message.channel)
+                handler_kwargs['player'] = await self.get_player(message.channel, message.author)
 
             if params.pop('permissions', None):
                 handler_kwargs['permissions'] = user_permissions
